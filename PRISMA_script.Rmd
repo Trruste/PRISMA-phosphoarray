@@ -2,7 +2,6 @@
 title: "PepArrayAnalysis"
 output: word_document
 ##
-###and the MEFV candidates are removed (experiment 52 to 57) only for the protein groups otherwise it messes up with the data
 
 
 # Prepare proteingroups file for further analysis
