@@ -1,0 +1,563 @@
+---
+title: "PepArrayAnalysis"
+output: word_document
+##
+###and the MEFV candidates are removed (experiment 52 to 57) only for the protein groups otherwise it messes up with the data
+
+
+# Prepare proteingroups file for further analysis
+#library(ez)
+library(dplyr)
+library(tidyr)
+library(Cairo)
+library(ggplot2)
+library(reshape2)
+
+#Load the ProteinGroups Data file
+proteinGroups <- read.delim("/Volumes/shared/TEMP/TR/phosphoproject/Katrina/proteinGroups.txt",stringsAsFactors = F)
+
+#fill empty gene name entries with UniprotIDs
+proteinGroups$Gene.names <- ifelse(proteinGroups$Gene.names == "", proteinGroups$Protein.IDs, proteinGroups$Gene.names) 
+
+#filter for contaminants, reverse hits and only identified by site
+proteinGroups <- proteinGroups[proteinGroups$Potential.contaminant!="+",]
+proteinGroups <- proteinGroups[proteinGroups$Only.identified.by.site!="+",]
+proteinGroups <- proteinGroups[proteinGroups$Reverse!="+",]
+
+#get rid of proteingroups containing the bait peptide
+proteinGroups <- proteinGroups[grepl("(^sp.*|^tr.*)",proteinGroups$Fasta.headers),]
+
+#repository for gene name protein ID mapping
+majorityIDsToGeneNames <- data.frame(cbind(proteinGroups$Majority.protein.IDs,proteinGroups$Gene.names))
+colnames(majorityIDsToGeneNames) <- c("Majority.protein.IDs","Gene.name")
+
+###Select only the LFQ columns
+LFQDaten <- proteinGroups[,c(1,6,7,grep("LFQ",names(proteinGroups)))]
+
+
+###filter the columns for MEFV candidates since they were mixed and don't need to be included in the analysis
+proteinGroups<-proteinGroups %>%
+ select(!LFQ.intensity.H.E_052 & !LFQ.intensity.H.E_053& !LFQ.intensity.H.E_054 & !LFQ.intensity.H.E_055 & !LFQ.intensity.H.E_056& !LFQ.intensity.H.E_057)
+
+```
+
+#add information about wt, phos or mut to LFQ values.... match the experiments to the peptide forms
+expgroup<- lapply(names(LFQDaten), function(x){
+  if (grepl("LFQ", x)){
+    label <- gsub(".*([L|M|H]).E_([0-9]*).*","\\1",x)#fetch L, M, or H label
+    expn <- gsub(".*([L|M|H]).E_([0-9]*).*","\\2",x)#fetch experiment number
+    expn <- as.numeric(unlist(expn))#transform to numeric
+    #turn around label swaps
+    #1: L:Wt M:Phos H:Mut
+    #2: L:Phos M:Mut H:Wt
+    #3: L:Mut M:Wt H:Phos
+    if(expn %% 3 == 1 && label == "L"){paste("wt",expn,sep="")}
+    else if(expn %% 3 == 1 && label == "M"){paste("phos",expn,sep="")}
+    else if(expn %% 3 == 1 && label == "H"){paste("mut",expn,sep="")}
+    else if(expn %% 3 == 2 && label == "L"){paste("phos",expn-1,sep="")}
+    else if(expn %% 3 == 2 && label == "M"){paste("mut",expn-1,sep="")}
+    else if(expn %% 3 == 2 && label == "H"){paste("wt",expn-1,sep="")}
+    else if(expn %% 3 == 0 && label == "L"){paste("mut",expn-2,sep="")}
+    else if(expn %% 3 == 0 && label == "M"){paste("wt",expn-2,sep="")}
+    else if(expn %% 3 == 0 && label == "H"){paste("phos",expn-2,sep="")}
+    else {""}
+  }
+  #give experimental group to blank samples 
+  else if (grepl("LFQ", x) && grepl("B",x)){label <- gsub(".*([L|H]).B([0-9]*).*","\\1",x)#fetch L or H label 
+  expn <- gsub(".*([L|H]).(B[0-9]).*","\\2",x)#fetch experiment number)
+  paste(label,expn)
+  }
+}
+)
+expgroup <- unlist(expgroup)
+expgroup <- expgroup[!is.null(expgroup)]
+expgroup <- expgroup[!expgroup==""]
+
+
+
+##We imputed missing values with random noise simulating the detection limit of the mass spectrometer (Hubner et al., 2010; Eberl et al., 2013; Keilhauer et al., 2015). To this end, imputed values are taken from a log normal distribution with 0.25× the standard deviation of the measured, logarithmized values, down-shifted by 1.8 standard deviations. In this way, we obtained a distribution of quantitative values for each protein across samples. These values represent unspecific binding to the affinity matrix or, in case of imputed values, a simulation of the detection limit of the mass spectrometer.(Hein et al. 2015 Cell)
+
+##Prepare the data to impute the missing LFQ values
+LFQDatenlog2 <- LFQDaten
+LFQDatenlog2[,c(4:length(colnames(LFQDaten)))] <-log(LFQDatenlog2[,c(4:length(colnames(LFQDaten)))],2)
+LFQDatenlog2 <- do.call(data.frame,lapply(LFQDatenlog2, function(x) replace(x, is.infinite(x),NA)))
+
+
+
+##############filter valid values: make logical dataframe to remember which proteins had actually been identified where
+LFQDatenlog2valid <- !is.na(LFQDatenlog2)#make logical dataframe for valid (non NA) entries
+LFQDatenlog2valid <- data.frame(LFQDatenlog2valid[,c(4:ncol(LFQDatenlog2valid))])#keep only columns with data from experiments
+colnames(LFQDatenlog2valid)<- expgroup #change column names to expgroups to be able to combine information of replicates
+
+#combine columns and set to TRUE if there is data for at least one of the replicates (code from http://stackoverflow.com/questions/21445029/condensing-combining-multiple-columns-with-same-name-and-logical-values)
+l <- sapply(LFQDatenlog2valid, is.logical)
+valids <- cbind(LFQDatenlog2valid[!l], lapply(split(as.list(LFQDatenlog2valid[l]), names(LFQDatenlog2valid)[l]), Reduce, f = `|`))
+
+
+#############actual imputation log2: impute on whole dataframe
+LFQDatenlog2Imp <- apply(LFQDatenlog2[,c(4:length(colnames(LFQDaten)))],2, function(x){
+  standd <- sd(x,na.rm = T) #standard deviation of the measured values
+  standd1 <- standd*0.25 #downscaling of the sd for imputing values
+  meand <- mean(x,na.rm = T) #mean of the measured values
+  meand1 <- meand - (1.8*standd) #downscaling of the sd for imputing values
+  sapply(x, function(y){
+    if(is.na(y)){
+      y <- rnorm(1, mean= meand1, sd=standd1)
+      return(y)
+    } else  if(!is.na(y)){return(y)}
+  })
+})
+LFQDatenlog2Imp <- data.frame(LFQDatenlog2Imp)
+
+
+# LFQ data: Volcano plots and significance
+
+#install.packages("Cairo")
+#install.packages("ggplot2")
+#install.packages("ggrepel")
+library(Cairo)
+library(ggplot2)
+library(ggrepel)
+
+#Preprare the data for statistics
+LFQDatenlog2Impt <- data.frame(t(LFQDatenlog2Imp))
+
+data <- LFQDatenlog2Impt
+
+# Make stats ----
+    volcanosale_woPhos <- lapply(unique(expgroup), function(x) {
+        # Take the belonging phos, mut or wt out of the t test because it could be too similar
+        # Change wt to mut or phos and create the group that should not be considered
+      #take the belonging mut, phos or wt out of the t test because it could be too similar
+      if(grepl("wt",x)){
+        nonconsid <- c(gsub("wt","mut",x),gsub("wt","phos",x))}#change wt to mut and phos and create the group that should not be considered
+      else if(grepl("phos",x)){nonconsid <- c(gsub("phos","wt",x),gsub("phos","mut",x))}#change phos to wt and mut and create the group that should not be considered
+      else if(grepl("mut",x)){nonconsid <- c(gsub("mut","wt",x),gsub("mut","phos",x))}#change mut to wt and phos and create the group that should not be considered
+      else nonconsid <- ""
+      keeping <- !(expgroup %in% nonconsid)#throw out partner peptide from analysis
+      keeping_phos <- !grepl("phos",expgroup)# throw out all phosphopeptides from comparison
+      keeping_test <- Reduce("&",list(keeping,keeping_phos))
+      keeping_exp <- expgroup==x
+      keeping_final <- Reduce("|",list(keeping_test,keeping_exp))
+      groups <- expgroup[keeping_final]#throw out partner peptide from analysis
+      groups[groups!=x] <- "BG"#call all groups that are not the experiment of interest in this cycle, BG (background)  
+      data1 <- data[, valids[[x]]]#keep only interaction partners that have really been identified with this peptide
+        
+        log2FC <- numeric()
+        p_vals_t <- numeric()
+        p_vals_w <- numeric()
+        for (cc in 1:ncol(data1)) {
+            A <- data1[,cc][keeping_final]
+            B <- groups
+          
+            ttest <- t.test(A ~ B)
+            log2FC[cc] <- ttest$estimate[2]-ttest$estimate[1]
+            p_vals_t[cc] <- (-log10(ttest$p.value))
+            wtest <- wilcox.test(A ~ B)
+            p_vals_w[cc] <- (-log10(wtest$p.value))
+        }
+        return(volcanosale_woPhos <- cbind(log2FC, p_vals_t, p_vals_w))
+    })
+    names(volcanosale_woPhos) <- unique(expgroup)
+    
+#############################################
+#Make the Volcano Plots based on LFQ intensities and volcanosale_woPhos stats
+library(ggplot2)
+library(ggrepel)
+library(dplyr)
+library(Cairo)
+#import candidate names
+candidates <- read.delim("S:/TEMP/TR/phospho project/Katrina/PeptideCandidates1.txt")
+# Define export parameters
+ty <- "pdf" # File type
+wi <- 500 # Width in pixels
+he <- 500 # Height in pixels
+re <- 75 # Resolution in dpi
+mte <- 10 # Main title text size
+# Create and export graph
+Cairo(file="S:/TEMP/TR/phospho project/Katrina/VolcanoPlots_trials/121022_Volcanoplots_1", type=ty, width=wi, height=he, pointsize=mte, dpi=re)
+axlim <- 10.5
+statistics <- "wcox"
+for(exp_vip in 1:117){
+  if (statistics == "ttest") a <- 2
+  else if (statistics == "wcox") a <- 3
+  volcanos_plot <- volcanosale_woPhos 
+  positive <- volcanos_plot[[exp_vip]][,3] >= -log(0.005,10) & volcanos_plot[[exp_vip]][,1]>2
+  plotdf <- data.frame(volcanos_plot[[exp_vip]][,c(1,a)])
+  colnames(plotdf) <- c("x","y")
+
+  g <- ggplot(plotdf, aes(x, y),echo=T) +
+    geom_point(colour=densCols(plotdf$x,plotdf$y,colramp=colorRampPalette(c("grey","black"))),size=2)+
+    theme_bw()+
+    xlab("Log2FC") +
+    ylab("-log[10] p value") +
+    ggtitle(paste("Peptide Number",exp_vip,candidates$Name[exp_vip], sep = " "))+ 
+    theme(plot.title = element_text(size=20, face="bold", vjust=2))+
+    geom_text_repel(data=plotdf[positive,],aes(label = LFQDaten$Gene.names[valids[[unique(expgroup)[exp_vip]]]][positive]), size = 3, max.overlaps = 200) 
+    theme_classic(base_size = 16)+
+    scale_x_continuous(limits=c(-axlim,axlim),breaks=seq(-axlim+0.5,axlim-0.5,2))+
+    scale_y_continuous(limits=c(0,5))+
+    geom_vline(xintercept=2, linetype="dotted", color ="red")+
+    geom_hline(yintercept=-log(0.005,10), linetype="dotted", color = "red")+
+    geom_hline(yintercept=0, linetype="dotted")
+  
+  figure <- print(g)
+  g
+}
+
+dev.off() # Close Cairo export
+
+##Prepare the data for Cytoscape 
+###############################################################################
+## Define variables to store enriched genes, proteins, and LFQ data
+#enriched genes for all pull-downs
+signgene <-list()
+signgene_loose <- list()
+signprot <- list()
+signmajorprot <- list()
+LFQplusminus <- list()
+
+
+
+statistics <- "wcox" # Choose between "ttest" or "wcox"
+
+# Loop through unique experiments
+for(i in unique(expgroup)){
+  if (statistics == "ttest") a <- 2
+  else if (statistics == "wcox") a <- 3
+  positive <- volcanosale_woPhos[[i]][,3] > -log(0.005,10) & volcanosale_woPhos[[i]][,1]>2
+  LFQplusminus[[i]] <- rep("-",nrow(LFQDaten))
+  LFQplusminus[[i]][valids[[i]]][positive] <- "+"
+  signgene[[i]] <- as.character(LFQDaten$Gene.names[valids[[i]]][positive])
+  signprot[[i]] <- as.character(LFQDaten$Protein.IDs[valids[[i]]][positive])
+  signmajorprot[[i]] <- as.character(proteinGroups$Majority.protein.IDs[valids[[i]]][positive])
+}
+
+#how many peptides have specific interactors
+specific_num <- lapply(signgene, function(x){identical(x,character(0)) })
+sum(!unlist(specific_num))
+
+LFQplusminus <- data.frame(LFQplusminus)
+colnames(LFQplusminus) <- unique(expgroup)
+rownames(LFQplusminus) <- LFQDaten$Protein.IDs
+LFQplusminuswt <- LFQplusminus[,grepl("wt",colnames(LFQplusminus))]
+colnames(LFQplusminuswt) <- seq(1,117,3)
+LFQplusminusmut <- LFQplusminus[,grepl("mut",colnames(LFQplusminus))]
+colnames(LFQplusminusmut) <- seq(1,117,3)
+LFQplusminusphos <- LFQplusminus[,grepl("phos",colnames(LFQplusminus))]
+colnames(LFQplusminusphos) <- seq(1,117,3)
+
+#preparation of wt LFQ data
+LFQplusminuswtt<-t(LFQplusminuswt)
+LFQplusminuswtmelt <- melt(LFQplusminuswtt)
+LFQplusminuswtmelt <- LFQplusminuswtmelt[order(LFQplusminuswtmelt$Var1),]
+colnames(LFQplusminuswtmelt) <- c("Expgroup","Majority.protein.IDs","LFQsignificantWt")
+
+#preparation of mut LFQ Data
+LFQplusminusmutt<-t(LFQplusminusmut)
+LFQplusminusmutmelt <- melt(LFQplusminusmutt)
+LFQplusminusmutmelt <- LFQplusminusmutmelt[order(LFQplusminusmutmelt$Var1),]
+colnames(LFQplusminusmutmelt) <- c("Expgroup","Majority.protein.IDs","LFQsignificantMut")
+
+##preparation of phos LFQ Data
+LFQplusminusphost<-t(LFQplusminusphos)
+LFQplusminusphosmelt <- melt(LFQplusminusphost)
+LFQplusminusphosmelt <- LFQplusminusphosmelt[order(LFQplusminusphosmelt$Var1),]
+colnames(LFQplusminusphosmelt) <- c("Expgroup","Majority.protein.IDs","LFQsignificantPhos")
+
+
+##Combine the WT, Mut and Phos Plusminus data to combine it easier with SILAC later
+combined_LFQplusminus <- left_join(LFQplusminusphosmelt, LFQplusminuswtmelt, by = c("Expgroup", "Majority.protein.IDs")) %>%
+  left_join(LFQplusminusmutmelt, by = c("Expgroup", "Majority.protein.IDs"))
+
+####################################################################################################
+
+##Generate list of SILAC data
+
+#Fetch the SILAC columns
+SILAC <- proteinGroups[,grepl("Ratio.[H|M|L].[H|M|L].E",colnames(proteinGroups))]
+SILAC <- log2(SILAC)#log2 transform SILAC ratios ##Log2 transform the ratios
+SILACnorm <- lapply(SILAC, function(x) x - median(x,na.rm = T)) #subtract median ratio of each experiment from each value in experiment 
+SILACnorm <- data.frame(SILACnorm)
+
+swapvector <- lapply(colnames(SILACnorm), function(x){
+  expn <- gsub(".*([L|M|H])\\.[L|M|H]\\.E_([0-9]*).*","\\2",x)#fetch experiment number
+  expn <- as.numeric(unlist(expn))#transform to numeric
+  label <- gsub(".*([L|M|H]\\.[L|M|H])\\.E_([0-9]*).*","\\1",x)#fetch L, M, or H label
+  
+  #turn around label swaps
+    #1: L:Wt M:Phos H:Mut
+    #2: L:Phos M:Mut H:Wt
+    #3: L:Mut M:Wt H:Phos
+  #exp mod 3 = 1: H/L : Mut/Wt, -1; M/L : Phos/Wt, -1 and H/M : Mut/Phos, -1.
+  #exp mod 3 = 2: H/L : Wt/Phos, 1; M/L : Mut/Phos, -1 and H/M: Wt/Mut, 1.
+  #exp mod 3 = 0: H/L : Phos/Mut, 1; M/L : Wt/Mut, 1 and H/M: Phos/Wt, 1.
+  
+  if (is.na(expn)) {return(1)}
+    else if(expn %% 3 == 1 && label == "H.L"){return(-1)}
+    else if(expn %% 3 == 1 && label == "M.L"){return(-1)}
+    else if(expn %% 3 == 1 && label == "H.M"){return(-1)}
+    else if(expn %% 3 == 2 && label == "H.L"){return(1)}
+    else if(expn %% 3 == 2 && label == "M.L"){return(-1)}
+    else if(expn %% 3 == 2 && label == "H.M"){return(1)}
+    else if(expn %% 3 == 0 && label == "H.L"){return(1)}
+    else if(expn %% 3 == 0 && label == "M.L"){return(1)}
+    else if(expn %% 3 == 0 && label == "H.M"){return(-1)}
+    else {""}
+}
+)
+swapvector <- unlist(swapvector)
+
+SILACnorm <- as.matrix(SILACnorm)
+SILACnormswap <- sweep(SILACnorm,MARGIN=2,swapvector,`*`) #multiply SILAC log2FC from each experiment either with 1 or -1 to swap label swapped samples
+SILACnormswap <- data.frame(SILACnormswap)
+
+# Plot SILAC scatter plots
+library(ggplot2)
+library(ggrepel)
+library(dplyr)
+library(tidyverse)
+
+
+##FILTERIN FOR TWO VALID VALUES (introducing NAs to those rows of replicates that have more than one NA)
+
+SILACgroupvalid <- lapply(names(SILACnorm), function(x){
+  expn <- gsub(".*([L|M|H])\\.[L|M|H]\\.E_([0-9]*).*","\\2",x)#fetch experiment number
+  expn <- as.numeric(unlist(expn))#transform to numeric
+  label <- gsub(".*([L|M|H]\\.[L|M|H])\\.E_([0-9]*).*","\\1",x)#fetch L, M, or H label
+  
+  #1: L:Wt M:Phos H:Mut
+    #2: L:Phos M:Mut H:Wt
+    #3: L:Mut M:Wt H:Phos
+  #exp mod 3 = 1: H/L : Mut/Wt, -1; M/L : Phos/Wt, -1 and H/M : Mut/Phos, -1.
+  #exp mod 3 = 2: H/L : Wt/Phos, 1; M/L : Mut/Phos, -1 and H/M: Wt/Mut, 1.
+  #exp mod 3 = 0: H/L : Phos/Mut, 1; M/L : Wt/Mut, 1 and H/M: Phos/Wt, 1.  
+  if(is.na(expn)){return(0)}#give experimental group to blank samples
+    else if(expn %% 3 == 1 && label == "H.L"){paste("wt_mut",expn,".1", sep="")} #("wt_mut",expn, ".1", sep=""
+    else if(expn %% 3 == 1 && label == "M.L"){paste("wt_phos",expn,".1",sep="")}
+    else if(expn %% 3 == 1 && label == "H.M"){paste("phos_mut",expn,".1", sep="")}
+    else if(expn %% 3 == 2 && label == "H.L"){paste("wt_phos",expn-1,".2",sep="")}
+    else if(expn %% 3 == 2 && label == "M.L"){paste("phos_mut",expn-1, ".2",sep="")}
+    else if(expn %% 3 == 2 && label == "H.M"){paste("wt_mut",expn-1,".2",sep="")}
+    else if(expn %% 3 == 0 && label == "H.L"){paste("phos_mut",expn-2,".3",sep="")}
+    else if(expn %% 3 == 0 && label == "M.L"){paste("wt_mut",expn-2,".3",sep="")}
+    else if(expn %% 3 == 0 && label == "H.M"){paste("wt_phos",expn-2,".3",sep="")}
+    else {""}
+}
+)
+SILACgroupvalid <- unlist(SILACgroupvalid)
+
+SILACnormswapvalid<-SILACnormswap #rename the SILACnormswap
+colnames(SILACnormswapvalid)<-SILACgroupvalid
+
+SILACnormswapvalid %>% 
+  colnames() %>% 
+  gsub(pattern = "[1-3]$", replacement = "", x = .) %>% 
+  unique -> samplevec
+
+lapply(samplevec, function(x){
+  SILACnormswapvalid %>%
+    select(contains(x)) -> df
+  df[rowSums(is.na(df)) > 1,] <- NA ##This line of code replaces rows in df that contain more than one NA value with NA
+  colnames(df) <- colnames(df)
+  return(df)
+}) %>%
+bind_cols -> SILACnormswap2val ##After all the modifications are applied to each column subset, the resulting data frames are combined column-wise and save them in a new dataframe SILACnormswap2val
+
+S_valt<-data.frame(t(SILACnormswap2val))
+
+S_valt<-rownames_to_column(as_tibble(rownames_to_column(S_valt,"Expgroup"))). #add a new column named "Expgroup" to the dataframe S_valt, containing the row names of S_valt.
+S_valt<-S_valt[,2:2101] ##keep only columns 2 to 2101. This operation removes the original row names from the dataframe.
+S_valt$Expgroup <- gsub(pattern = ".[1-3]$", replacement = "", x =S_valt$Expgroup)
+
+##Take the median of the replicates
+SILACnormswaptmed <- aggregate(S_valt[,2:ncol(S_valt)],list(S_valt$Expgroup),median,na.rm=T)
+colnames(SILACnormswaptmed) <- c("Expgroup",as.character(proteinGroups$Majority.protein.IDs))
+
+
+##############################################################################################
+
+# Install (if needed) required packages ----
+pkgs_list <- c("ggrepel",
+               "ggplot2",
+               "Cairo",
+               "ggpubr")
+
+
+LFQplusminust<-data.frame(t(LFQplusminus))
+LFQplusminust<-rownames_to_column(LFQplusminust,var="Expgroup") ##Use the LFQplusminus from before to fetch the LFQ positive hits
+
+
+#, dpi=re
+# Define export parameters
+ty <- "pdf" # File type
+wi <- 500 # Width in pixels
+he <- 500 # Height in pixels
+re <- 75 # Resolution in dpi
+mte <- 10 # Main title text size
+#"wt_mut","wt_phos","phos_mut"
+exp_type <- ""
+
+# Create and export graph
+Cairo(file=paste("/Users/trruste/Documents/12102022_SILACscatterplots_1_sameasVolcano_",exp_type,sep="_"), type=ty, width=wi, height=he, pointsize=mte, dpi=re)
+enum <- -1
+signrat <- 1
+#check out highest and lowest SILAC ratios to set axlim accordingly
+axlim <- 6
+aylim <- 6
+
+
+for(ii in seq(1, 117, by = 3)){
+  enum <- enum+2
+  ####g1  
+  exptype1 <- "wt_phos"
+  exptype<-"wt_mut"
+  exp1 <- paste(exptype1,ii,sep="")
+  exp2 <- paste(exptype,ii,sep="")
+  plotdf1 <- subset(SILACnormswaptmed, Expgroup == exp1 | Expgroup == exp2)
+  plotdf1 <- as.data.frame(t(plotdf1[,2:ncol(plotdf1)]))
+  colnames(plotdf1) <- c("x","y")
+  
+  ###adding color column
+  colorvector <- densCols(plotdf1$x,plotdf1$y,colramp=colorRampPalette(c("grey","black")))
+  
+  ##we need to determine what is significant from LFQ
+  lfq_exptype<-"wt"
+  lfq_exptype1<-"mut"
+  lfq_exptype2<-"phos"
+  lfq_exp<-paste(lfq_exptype,ii,sep="")
+  lfq_exp1<-paste(lfq_exptype1,ii,sep="")
+  lfq_exp2<-paste(lfq_exptype2,ii,sep="")
+  
+  tmp <- t(subset(LFQplusminust, Expgroup == lfq_exp | Expgroup == lfq_exp1 | Expgroup == lfq_exp2 ))
+  colnames(tmp) <- tmp[1,]
+  tmp <- tmp[2:nrow(tmp),]
+
+  coords <- match(c(lfq_exp, lfq_exp1, lfq_exp2), colnames(tmp))
+  tmp <- tmp[,coords]
+  
+  wts <- which(tmp[,1] == '+' & tmp[,2] == '-' & tmp[,3] == '-')
+  mts <- which(tmp[,1] == '-' & tmp[,2] == '+' & tmp[,3] == '-')
+  phs <- which(tmp[,1] == '-' & tmp[,2] == '-' & tmp[,3] == '+')
+  wms <- which(tmp[,1] == '+' & tmp[,2] == '+' & tmp[,3] == '-')
+  mps <- which(tmp[,1] == '-' & tmp[,2] == '+' & tmp[,3] == '+')
+  inall <- which(tmp[,1] == '+' & tmp[,2] == '+' & tmp[,3] == '+')
+  wps <- which(tmp[,1] == '+' & tmp[,2] == '-' & tmp [,3] == '+')
+  
+  colorvector[wts] <- 'lightgoldenrod1'
+  colorvector[mts] <- 'red3'
+  colorvector[phs] <- 'dodgerblue'
+  colorvector[wms] <- 'darkorange'
+  colorvector[mps] <- 'darkorchid4'
+  colorvector[inall] <- 'lightpink'
+  colorvector[wps] <- 'darkgreen'
+  
+  g1 <- ggplot(plotdf1, aes(x, y),echo=T) +
+    geom_point(colour=colorvector, size=2)+
+    theme_bw()+
+    xlab("Ratio Log2FC wt/mut") +
+    ylab("Ratio Log2FC wt/phos") +
+    ggtitle(paste("Experiment",exp1,"/",exp2,candidates$ID[candidates$Expgroup==enum],sep = " "))+
+    #theme(plot.title = element_text(size=20, face="bold", vjust=2))+
+    geom_text_repel(data=plotdf1[!(plotdf1$x<=signrat&plotdf1$y<=signrat& plotdf1$x>=(-1)&plotdf1$y>=(-1)),],aes(label = 
+    sapply(strsplit(LFQDaten$Gene.names[!(plotdf1$x<=signrat&plotdf1$y<=signrat& plotdf1$x>=(-1)&plotdf1$y>=(-1))],";"),"[[",1)),size = 3, max.overlaps = 200) +
+    theme_classic(base_size = 14)+
+    scale_x_continuous(limits=c(-axlim,axlim),breaks=seq(-axlim,axlim,1))+scale_y_continuous(limits=c(-aylim,aylim),breaks=seq(-aylim,aylim,1))+
+    #geom_vline(xintercept=0, linetype="dotted")+
+    geom_vline(xintercept = 1, linetype="dotted", color = "grey")+
+    geom_vline(xintercept = (-1), linetype="dotted", color = "grey")+
+    #geom_hline(yintercept=0, linetype="dotted")+
+    geom_hline(yintercept = 1, linetype="dotted", color = "grey")+
+    geom_hline(yintercept = (-1), linetype="dotted", color = "grey")
+  
+ 
+  figure <- print(g1)
+  
+  #figure <- print(g)
+  
+}
+dev.off() # Close Cairo export
+
+####Combine the SILAC with the LFQ data for Cytoscape
+#prepare the data to combine it with LFQplusminus
+SILACmedmelt <- melt(SILACnormswaptmed,id.vars = "Expgroup")
+SILACmedmelt$SILACgroup<-(as.character(SILACmedmelt$Expgroup))
+
+SILACmedmelt$Expgroup <- gsub("\\D","",SILACmedmelt$Expgroup)
+colnames(SILACmedmelt) <- c("Expgroup","Majority.protein.IDs","Median.SILAC.ratio","SILACgroup")
+SILACmedmelt <- merge(SILACmedmelt,majorityIDsToGeneNames,by = "Majority.protein.IDs")
+
+#### combine with LFQ values
+SILACLFQ <- merge(SILACmedmelt,combined_LFQplusminus,by=c("Majority.protein.IDs"))
+
+SILACLFQ$Median.SILAC.ratio<-as.numeric(SILACLFQ$Median.SILAC.ratio)
+SILACLFQ_sig<-subset(SILACLFQ,Median.SILAC.ratio >=(1)|Median.SILAC.ratio<=(-1)) ## select only SILAC ratios that are significant
+SILACLFQ_sig<-subset(SILACLFQ_sig,LFQsignificantWt=="+"|LFQsignificantMut=="+"|LFQsignificantPhos=="+") ## significant SILAC ratios that have significant LFQ value
+
+
+SILACLFQmelt_sig<- merge(ProteinsIDsToGeneNames,SILACLFQ_sig, by="Majority.protein.IDs")
+colnames(ProteinsIDsToGeneNames)<-c("Majority.protein.IDs","Gene.names")
+#SILACmelt <- SILACmelt_sig[order(SILACmelt_sig$SILACgroup),]
+
+## this table is used to make the cytoscape peptide-protein network
+write.table(SILACLFQmelt_sig,"SILACLFQmelt_sign.txt",sep = "\t")  ##export table to sort it in excel
+
+
+
+###############################
+##### a bar chart graph counting the number of proteins identified in each pull down (mean of the three replicates was taken into account)
+
+LFQDaten_bar<-LFQDatenlog2[,c(4:348)]
+colnames(LFQDaten_bar)<-expgroup
+LFQDaten_bar<-data.frame(t(apply(LFQDaten_bar,1, function(x) tapply(x,colnames(LFQDaten_bar),mean, na.rm=TRUE))))
+
+LFQDaten_bar<-LFQDaten_bar %>%
+ select(!wt52 & !mut52 & !phos52 & !wt55& !mut55 & !phos55) ##Remove the MEFV candidate that was mixed up from analysis
+
+LFQ_bar<-LFQDaten_bar %>% 
+  gather(Var, Val)%>% 
+  count(Var, Val)
+
+##Plot the chart
+g1<-ggplot(LFQ_bar, aes(x = Var)) +
+  geom_bar()+
+  xlab("experiment number") +
+  ylab("Number of proteins identified")+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+g1
+
+ggsave("S:/TEMP/TR/phospho project/paper/barchart_mean.pdf", plot = g1, width = 15, height = 10, dpi = 100)
+
+sum(!is.na(LFQDaten_bar$mut19))
+sum(!is.na(LFQDaten_bar$phos19))
+sum(!is.na(LFQDaten_bar$wt19))
+
+
+########Bar plot showing the number of specific interactors 
+LFQ_sig_counts <- data.frame(
+  Column = c("Phos_Total", "Phos_unique", "Wt_total", "Wt_Unique", "Mut_total", "Mut_Unique", "Phos and Wt", "Phos and Mut", "Wt and Mut", "All three peptides"),
+  Count = c(
+    sum((combined_LFQplusminus$LFQsignificantPhos == "+" & combined_LFQplusminus$LFQsignificantWt == "-" & combined_LFQplusminus$LFQsignificantMut == "-") | (combined_LFQplusminus$LFQsignificantPhos == "+" & combined_LFQplusminus$LFQsignificantWt == "+" & combined_LFQplusminus$LFQsignificantMut == "-") | (combined_LFQplusminus$LFQsignificantPhos == "+" & combined_LFQplusminus$LFQsignificantWt == "-" & combined_LFQplusminus$LFQsignificantMut == "+") | (combined_LFQplusminus$LFQsignificantPhos == "+" & combined_LFQplusminus$LFQsignificantWt == "+" & combined_LFQplusminus$LFQsignificantMut == "+")),
+    sum(combined_LFQplusminus$LFQsignificantPhos == "+" & combined_LFQplusminus$LFQsignificantWt == "-" & combined_LFQplusminus$LFQsignificantMut == "-"),
+    sum((combined_LFQplusminus$LFQsignificantPhos == "-" & combined_LFQplusminus$LFQsignificantWt == "+" & combined_LFQplusminus$LFQsignificantMut == "-") | (combined_LFQplusminus$LFQsignificantPhos == "+" & combined_LFQplusminus$LFQsignificantWt == "+" & combined_LFQplusminus$LFQsignificantMut == "-") | (combined_LFQplusminus$LFQsignificantPhos == "-" & combined_LFQplusminus$LFQsignificantWt == "+" & combined_LFQplusminus$LFQsignificantMut == "+") | (combined_LFQplusminus$LFQsignificantPhos == "+" & combined_LFQplusminus$LFQsignificantWt == "+" & combined_LFQplusminus$LFQsignificantMut == "+")),
+    sum(combined_LFQplusminus$LFQsignificantPhos == "-" & combined_LFQplusminus$LFQsignificantWt == "+" & combined_LFQplusminus$LFQsignificantMut == "-"),
+    sum((combined_LFQplusminus$LFQsignificantPhos == "+" & combined_LFQplusminus$LFQsignificantWt == "-" & combined_LFQplusminus$LFQsignificantMut == "+") | (combined_LFQplusminus$LFQsignificantPhos == "-" & combined_LFQplusminus$LFQsignificantWt == "+" & combined_LFQplusminus$LFQsignificantMut == "+") |
+(combined_LFQplusminus$LFQsignificantPhos == "-" & combined_LFQplusminus$LFQsignificantWt == "-" & combined_LFQplusminus$LFQsignificantMut == "+") |
+(combined_LFQplusminus$LFQsignificantPhos == "+" & combined_LFQplusminus$LFQsignificantWt == "+" & combined_LFQplusminus$LFQsignificantMut == "+")),
+    sum(combined_LFQplusminus$LFQsignificantPhos == "-" & combined_LFQplusminus$LFQsignificantWt == "-" & combined_LFQplusminus$LFQsignificantMut == "+"),
+    sum(combined_LFQplusminus$LFQsignificantPhos == "+" & combined_LFQplusminus$LFQsignificantWt == "+" & combined_LFQplusminus$LFQsignificantMut == "-"),
+    sum(combined_LFQplusminus$LFQsignificantPhos == "+" & combined_LFQplusminus$LFQsignificantWt == "-" & combined_LFQplusminus$LFQsignificantMut == "+"),
+    sum(combined_LFQplusminus$LFQsignificantPhos == "-" & combined_LFQplusminus$LFQsignificantWt == "+" & combined_LFQplusminus$LFQsignificantMut == "+"),
+    sum(combined_LFQplusminus$LFQsignificantPhos == "+" & combined_LFQplusminus$LFQsignificantWt == "+" & combined_LFQplusminus$LFQsignificantMut == "+")
+  )
+)
+
+# Bar plot
+plot <- ggplot(data=LFQ_sig_counts, aes(x = Column, y = Count)) +
+  geom_bar(stat="Identity") 
+# Print the plot
+print(plot)
+
+
+
+
