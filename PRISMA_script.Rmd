@@ -13,7 +13,7 @@ library(ggplot2)
 library(reshape2)
 
 #Load the ProteinGroups Data file
-proteinGroups <- read.delim("/Volumes/shared/TEMP/TR/phosphoproject/Katrina/proteinGroups.txt",stringsAsFactors = F)
+proteinGroups <- read.delim("/path/to/your/directory/proteinGroups.txt",stringsAsFactors = F) ##Change the path to the MaxQuant output folder
 
 #fill empty gene name entries with UniprotIDs
 proteinGroups$Gene.names <- ifelse(proteinGroups$Gene.names == "", proteinGroups$Protein.IDs, proteinGroups$Gene.names) 
@@ -166,7 +166,7 @@ library(ggrepel)
 library(dplyr)
 library(Cairo)
 #import candidate names
-candidates <- read.delim("S:/TEMP/TR/phospho project/Katrina/PeptideCandidates1.txt")
+candidates <- read.delim("path/to/your/directory/PeptideCandidates1.txt") ##Change the path accoridngly
 # Define export parameters
 ty <- "pdf" # File type
 wi <- 500 # Width in pixels
@@ -174,7 +174,7 @@ he <- 500 # Height in pixels
 re <- 75 # Resolution in dpi
 mte <- 10 # Main title text size
 # Create and export graph
-Cairo(file="S:/TEMP/TR/phospho project/Katrina/VolcanoPlots_trials/121022_Volcanoplots_1", type=ty, width=wi, height=he, pointsize=mte, dpi=re)
+Cairo(file="path/to/your/favorite/directoray/VolcanoPlots", type=ty, width=wi, height=he, pointsize=mte, dpi=re) ##Add the path where you want to save your volcano plots
 axlim <- 10.5
 statistics <- "wcox"
 for(exp_vip in 1:117){
@@ -398,7 +398,7 @@ mte <- 10 # Main title text size
 exp_type <- ""
 
 # Create and export graph
-Cairo(file=paste("/Users/trruste/Documents/12102022_SILACscatterplots_1_sameasVolcano_",exp_type,sep="_"), type=ty, width=wi, height=he, pointsize=mte, dpi=re)
+Cairo(file=paste("/path/to/your/favorite/direcotry/SILACScatterplots",exp_type,sep="_"), type=ty, width=wi, height=he, pointsize=mte, dpi=re) ##Change the path to the folder you want to save your ScatterPlots
 enum <- -1
 signrat <- 1
 #check out highest and lowest SILAC ratios to set axlim accordingly
@@ -525,7 +525,7 @@ g1<-ggplot(LFQ_bar, aes(x = Var)) +
   theme(axis.text.x = element_text(angle = 90, hjust = 1))
 g1
 
-ggsave("S:/TEMP/TR/phospho project/paper/barchart_mean.pdf", plot = g1, width = 15, height = 10, dpi = 100)
+ggsave("path/to/your/favorite/directory/barchart_mean.pdf", plot = g1, width = 15, height = 10, dpi = 100) #change the path to where you want to save your barchart plot
 
 sum(!is.na(LFQDaten_bar$mut19))
 sum(!is.na(LFQDaten_bar$phos19))
